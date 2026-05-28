@@ -1,0 +1,429 @@
+"""
+HealthTech AI Pipeline — Laboratório Integrador
+Passo a Passo: QLoRA + RAG Simulado + FlashAttention + KV Cache
+Código gerado parcialmente por IA, revisado por Agenor Neto
+"""
+
+import time
+import gc
+import json
+import os
+import torch
+
+# ─── Verificação de ambiente ─────────────────────────────────────────────────
+
+def check_environment():
+    """Verifica se CUDA está disponível e exibe informações do ambiente."""
+    print("=" * 70)
+    print("  HEALTHTECH AI PIPELINE — Laboratório Integrador")
+    print("=" * 70)
+
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+        print(f"\n✅ GPU detectada: {gpu_name}")
+        print(f"   VRAM Total: {total_vram:.0f} MB")
+    else:
+        print("\n⚠️  CUDA não disponível — executando em modo CPU (simulado).")
+        print("   Em produção, este pipeline requer GPU com suporte a CUDA.")
+
+    print()
+
+
+# ─── Helpers de memória ──────────────────────────────────────────────────────
+
+def get_vram_mb() -> float:
+    """Retorna VRAM alocada atualmente em MB (0 se sem GPU)."""
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / (1024 ** 2)
+    return 0.0
+
+
+def get_peak_vram_mb() -> float:
+    """Retorna o pico de VRAM alocado desde o último reset em MB."""
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / (1024 ** 2)
+    return 0.0
+
+
+def reset_peak_vram():
+    """Reseta o contador de pico de VRAM."""
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def free_memory():
+    """Libera cache de GPU e força coleta de lixo."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+# ─── PASSO 1: Ingestão Eficiente — QLoRA 4-bit ──────────────────────────────
+
+def step1_load_model_qlora(model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
+    """
+    Carrega modelo e tokenizador usando quantização QLoRA em 4-bits.
+    Registra VRAM ocupada após o carregamento.
+    """
+    print("─" * 70)
+    print("PASSO 1 — Ingestão Eficiente com QLoRA (4-bit)")
+    print("─" * 70)
+
+    try:
+        from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+    except ImportError:
+        raise ImportError("Execute: pip install transformers accelerate bitsandbytes")
+
+    print(f"\n📦 Carregando tokenizador: {model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,        # quantização dupla para menor footprint
+        bnb_4bit_quant_type="nf4",             # NormalFloat4 — padrão QLoRA
+    )
+
+    free_memory()
+    reset_peak_vram()
+    vram_before = get_vram_mb()
+
+    print(f"🔧 Carregando modelo em 4-bit QLoRA...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=bnb_config,
+        device_map="auto",          # distribui camadas automaticamente
+        torch_dtype=torch.float16,
+    )
+    model.eval()
+
+    vram_after = get_vram_mb()
+    vram_used  = vram_after - vram_before
+
+    print(f"\n📊 MÉTRICA — VRAM após carregamento QLoRA:")
+    print(f"   Antes : {vram_before:.1f} MB")
+    print(f"   Depois: {vram_after:.1f} MB")
+    print(f"   Delta : {vram_used:.1f} MB  ← footprint do modelo quantizado")
+
+    return model, tokenizer, {"vram_model_mb": vram_used}
+
+
+# ─── PASSO 2: Simulando o RAG Massivo ───────────────────────────────────────
+
+def step2_simulate_rag(tokenizer, target_tokens: int = 12_000):
+    """
+    Gera texto médico fictício simulando documentos recuperados pelo RAG.
+    Retorna os input_ids com aproximadamente `target_tokens` tokens.
+    """
+    print("\n" + "─" * 70)
+    print("PASSO 2 — Simulando RAG Massivo (contexto médico ~12.000 tokens)")
+    print("─" * 70)
+
+    # Blocos de texto médico fictício para composição do contexto massivo
+    paragraphs = [
+        # Capítulo 1 — Cardiologia
+        (
+            "Capítulo 1: Insuficiência Cardíaca Congestiva (ICC). "
+            "A ICC é uma síndrome clínica resultante de alteração estrutural ou funcional do coração "
+            "que compromete a capacidade ventricular de receber ou ejetar sangue em volume suficiente "
+            "para atender às demandas metabólicas teciduais. Os marcadores de BNP e NT-proBNP são "
+            "essenciais na estratificação de risco. O tratamento baseia-se em inibidores da ECA, "
+            "betabloqueadores e antagonistas da aldosterona. "
+        ) * 30,
+
+        # Capítulo 2 — Pneumologia
+        (
+            "Capítulo 2: Doença Pulmonar Obstrutiva Crônica (DPOC). "
+            "Definida por limitação persistente ao fluxo aéreo, geralmente progressiva e associada a "
+            "resposta inflamatória crônica das vias aéreas e parênquima pulmonar a partículas ou gases "
+            "nocivos. O diagnóstico espirométrico requer VEF1/CVF pós-broncodilatador < 0,70. "
+            "Os estadiamentos GOLD I a IV orientam a terapêutica com LABA, LAMA e corticoides inalatórios. "
+        ) * 30,
+
+        # Capítulo 3 — Endocrinologia
+        (
+            "Capítulo 3: Diabetes Mellitus Tipo 2 e Síndrome Metabólica. "
+            "O DM2 caracteriza-se por resistência insulínica periférica e relativa deficiência secretória "
+            "das células β pancreáticas. A hemoglobina glicada (HbA1c) é o padrão-ouro de monitoramento "
+            "glicêmico. Novos agentes como inibidores de SGLT2 e análogos de GLP-1 demonstram benefício "
+            "cardiovascular e renal além do controle glicêmico. "
+        ) * 30,
+
+        # Capítulo 4 — Nefrologia
+        (
+            "Capítulo 4: Doença Renal Crônica (DRC). "
+            "A DRC é definida por alterações estruturais ou funcionais renais presentes por mais de três meses. "
+            "A TFG estimada pela equação CKD-EPI estratifica os estágios G1-G5. A proteinúria é o principal "
+            "marcador de progressão. Manejo inclui controle pressórico rigoroso com SRAA e restrição proteica. "
+        ) * 30,
+
+        # Capítulo 5 — Hematologia
+        (
+            "Capítulo 5: Anemias — Classificação e Conduta. "
+            "As anemias são classificadas morfologicamente (microcítica, normocítica, macrocítica) e "
+            "fisiopatologicamente (hipo/arregenerativa, hemolítica, por perda). A ferropriva é a mais "
+            "prevalente mundialmente. O diagnóstico diferencial inclui análise do esfregaço, reticulócitos, "
+            "ferritina, VCM e LDH. "
+        ) * 30,
+    ]
+
+    full_context = "\n\n".join(paragraphs)
+
+    print(f"\n📄 Tokenizando contexto médico gerado...")
+    tokens = tokenizer(
+        full_context,
+        return_tensors="pt",
+        truncation=True,
+        max_length=target_tokens,
+    )
+
+    actual_tokens = tokens["input_ids"].shape[1]
+    print(f"   Tokens gerados : {actual_tokens:,}")
+    print(f"   Alvo           : {target_tokens:,} tokens")
+    print(f"   Tamanho (chars): {len(full_context):,}")
+
+    return tokens, {"context_tokens": actual_tokens}
+
+
+# ─── PASSO 3: Geração SEM Cache (O Gargalo) ─────────────────────────────────
+
+def step3_generate_no_cache(model, tokenizer, input_tokens, new_tokens: int = 100):
+    """
+    Gera `new_tokens` novos tokens com KV Cache DESATIVADO.
+    Mede tempo e pico de VRAM — demonstra o gargalo O(n²).
+    """
+    print("\n" + "─" * 70)
+    print("PASSO 3 — Geração SEM KV Cache (recálculo redundante Q, K, V)")
+    print("─" * 70)
+
+    device = next(model.parameters()).device
+    input_ids = input_tokens["input_ids"].to(device)
+
+    # Desativa KV Cache — força recálculo de Q, K, V a cada token
+    model.config.use_cache = False
+    free_memory()
+    reset_peak_vram()
+
+    print(f"\n⚙️  Gerando {new_tokens} tokens com use_cache=False ...")
+    print("   (Atenção: cada token recalcula toda a sequência de atenção)")
+
+    t_start = time.perf_counter()
+
+    with torch.no_grad():
+        output = model.generate(
+            input_ids,
+            max_new_tokens=new_tokens,
+            do_sample=False,
+            use_cache=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    t_end = time.perf_counter()
+    elapsed   = t_end - t_start
+    peak_vram = get_peak_vram_mb()
+
+    tokens_per_sec = new_tokens / elapsed if elapsed > 0 else 0
+
+    print(f"\n📊 MÉTRICAS — Sem KV Cache:")
+    print(f"   Tempo total     : {elapsed:.2f}s")
+    print(f"   Tokens/segundo  : {tokens_per_sec:.2f}")
+    print(f"   Pico de VRAM    : {peak_vram:.1f} MB")
+    print(f"   ⚠️  Complexidade : O(n²) — custo cresce quadraticamente!")
+
+    return {
+        "time_no_cache_s": elapsed,
+        "peak_vram_no_cache_mb": peak_vram,
+        "tokens_per_sec_no_cache": tokens_per_sec,
+    }
+
+
+# ─── PASSO 4: Geração COM KV Cache + FlashAttention-2 ───────────────────────
+
+def step4_generate_optimized(
+    tokenizer,
+    input_tokens,
+    model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    new_tokens: int = 100,
+):
+    """
+    Recarrega o modelo com FlashAttention-2 e gera com KV Cache ATIVADO.
+    Mede e compara tempo e pico de VRAM com o passo anterior.
+    """
+    print("\n" + "─" * 70)
+    print("PASSO 4 — Geração COM KV Cache + FlashAttention-2 (Otimizado)")
+    print("─" * 70)
+
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+
+    free_memory()
+    reset_peak_vram()
+
+    print("\n🔧 Recarregando modelo com FlashAttention-2...")
+    try:
+        model_opt = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.float16,
+            attn_implementation="flash_attention_2",   # ← otimização hardware-aware
+        )
+        flash_used = True
+        print("   ✅ FlashAttention-2 ativado")
+    except Exception as e:
+        print(f"   ⚠️  FlashAttention-2 não disponível ({e})")
+        print("   ↩️  Fallback: carregando sem FlashAttention-2")
+        model_opt = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.float16,
+        )
+        flash_used = False
+
+    model_opt.eval()
+    model_opt.config.use_cache = True   # ← KV Cache ATIVADO
+
+    device    = next(model_opt.parameters()).device
+    input_ids = input_tokens["input_ids"].to(device)
+
+    free_memory()
+    reset_peak_vram()
+
+    print(f"\n⚙️  Gerando {new_tokens} tokens com use_cache=True + FlashAttention-2 ...")
+
+    t_start = time.perf_counter()
+
+    with torch.no_grad():
+        output = model_opt.generate(
+            input_ids,
+            max_new_tokens=new_tokens,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    t_end = time.perf_counter()
+    elapsed   = t_end - t_start
+    peak_vram = get_peak_vram_mb()
+
+    tokens_per_sec = new_tokens / elapsed if elapsed > 0 else 0
+
+    print(f"\n📊 MÉTRICAS — Com KV Cache + FlashAttention-2:")
+    print(f"   Tempo total     : {elapsed:.2f}s")
+    print(f"   Tokens/segundo  : {tokens_per_sec:.2f}")
+    print(f"   Pico de VRAM    : {peak_vram:.1f} MB")
+    print(f"   FlashAttention  : {'✅ Ativado' if flash_used else '⚠️ Fallback'}")
+    print(f"   ✅ Complexidade : O(n) em VRAM com FlashAttention + O(n) tempo com KV Cache")
+
+    del model_opt
+    free_memory()
+
+    return {
+        "time_optimized_s": elapsed,
+        "peak_vram_optimized_mb": peak_vram,
+        "tokens_per_sec_optimized": tokens_per_sec,
+        "flash_attention_used": flash_used,
+    }
+
+
+# ─── RELATÓRIO FINAL ─────────────────────────────────────────────────────────
+
+def print_final_report(metrics: dict):
+    """Exibe o relatório comparativo consolidado."""
+    print("\n" + "=" * 70)
+    print("  RELATÓRIO FINAL — COMPARATIVO DE DESEMPENHO")
+    print("=" * 70)
+
+    m1 = metrics.get("step1", {})
+    m2 = metrics.get("step2", {})
+    m3 = metrics.get("step3", {})
+    m4 = metrics.get("step4", {})
+
+    print(f"""
+┌─────────────────────────────────────────────────────────────────────┐
+│  PASSO 1 — Carregamento QLoRA (4-bit)                               │
+│  VRAM consumida pelo modelo : {m1.get('vram_model_mb', 0):>8.1f} MB                    │
+├─────────────────────────────────────────────────────────────────────┤
+│  PASSO 2 — Contexto RAG Simulado                                    │
+│  Tokens no prompt           : {m2.get('context_tokens', 0):>8,} tokens                │
+├─────────────────────────────────────────────────────────────────────┤
+│  PASSO 3 — Geração SEM KV Cache (gargalo)                           │
+│  Tempo de geração           : {m3.get('time_no_cache_s', 0):>8.2f} s                      │
+│  Throughput                 : {m3.get('tokens_per_sec_no_cache', 0):>8.2f} tok/s                  │
+│  Pico de VRAM               : {m3.get('peak_vram_no_cache_mb', 0):>8.1f} MB                    │
+├─────────────────────────────────────────────────────────────────────┤
+│  PASSO 4 — Geração COM KV Cache + FlashAttention-2 (otimizado)      │
+│  Tempo de geração           : {m4.get('time_optimized_s', 0):>8.2f} s                      │
+│  Throughput                 : {m4.get('tokens_per_sec_optimized', 0):>8.2f} tok/s                  │
+│  Pico de VRAM               : {m4.get('peak_vram_optimized_mb', 0):>8.1f} MB                    │
+│  FlashAttention-2           : {'✅ Ativo  ' if m4.get('flash_attention_used') else '⚠️  Fallback'}                          │
+├─────────────────────────────────────────────────────────────────────┤
+│  GANHO DE DESEMPENHO                                                │""")
+
+    t3 = m3.get("time_no_cache_s", 0)
+    t4 = m4.get("time_optimized_s", 0)
+    v3 = m3.get("peak_vram_no_cache_mb", 0)
+    v4 = m4.get("peak_vram_optimized_mb", 0)
+
+    speedup    = t3 / t4   if t4 > 0 else float("inf")
+    vram_saved = v3 - v4
+
+    print(f"│  Speedup (tempo)            : {speedup:>8.2f}x                          │")
+    print(f"│  VRAM economizada           : {vram_saved:>8.1f} MB                    │")
+    print("└─────────────────────────────────────────────────────────────────────┘")
+
+    # Salva métricas em JSON para auditoria
+    with open("/home/claude/healthtech_lab/metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
+    print("\n💾 Métricas salvas em metrics.json")
+
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+
+def main():
+    MODEL_NAME  = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    NEW_TOKENS  = 100
+    RAG_TOKENS  = 12_000
+
+    metrics = {}
+
+    check_environment()
+
+    # Passo 1
+    model, tokenizer, m1 = step1_load_model_qlora(MODEL_NAME)
+    metrics["step1"] = m1
+
+    # Passo 2
+    input_tokens, m2 = step2_simulate_rag(tokenizer, target_tokens=RAG_TOKENS)
+    metrics["step2"] = m2
+
+    # Passo 3 — sem cache (gargalo)
+    m3 = step3_generate_no_cache(model, tokenizer, input_tokens, new_tokens=NEW_TOKENS)
+    metrics["step3"] = m3
+
+    # Libera modelo antes de recarregar com FlashAttention
+    del model
+    free_memory()
+
+    # Passo 4 — otimizado
+    m4 = step4_generate_optimized(tokenizer, input_tokens, MODEL_NAME, new_tokens=NEW_TOKENS)
+    metrics["step4"] = m4
+
+    # Relatório final
+    print_final_report(metrics)
+
+    print("\n✅ Pipeline concluído com sucesso!\n")
+
+
+if __name__ == "__main__":
+    main()
